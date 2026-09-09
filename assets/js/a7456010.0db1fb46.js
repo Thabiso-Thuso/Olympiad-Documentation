@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkOlympiad_Portal_Documentaion=self.webpackChunkOlympiad_Portal_Documentaion||[]).push([["3056"],{8552(a){a.exports=JSON.parse('{"name":"docusaurus-plugin-content-pages","id":"default"}')}}]);

@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkOlympiad_Portal_Documentaion=self.webpackChunkOlympiad_Portal_Documentaion||[]).push([["6762"],{7089(e,a,c){c.d(a,{createArchitectureServices:()=>t.S});var t=c(5796);c(4954)}}]);

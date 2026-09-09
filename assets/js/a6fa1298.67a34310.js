@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkOlympiad_Portal_Documentaion=self.webpackChunkOlympiad_Portal_Documentaion||[]).push([["6428"],{7545(a){a.exports=JSON.parse('{"metadata":{"permalink":"/Olympiad-Documentation/blog","page":1,"postsPerPage":10,"totalPages":1,"totalCount":4,"blogDescription":"Blog","blogTitle":"Blog"}}')}}]);
