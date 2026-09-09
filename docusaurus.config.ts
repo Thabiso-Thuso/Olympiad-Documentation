@@ -23,12 +23,12 @@ const config: Config = {
   url: 'https://thabiso-thuso.github.io',  
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
-  baseUrl: '/Olymipad-Documentation/',
+  baseUrl: '/Olympiad-Documentation/',
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
   organizationName: 'Thabiso-Thuso', // Usually your GitHub org/user name.
-  projectName: 'Olymipad-Documentation', // Usually your repo name.
+  projectName: 'Olympiad-Documentation', // Usually your repo name.
   trailingSlash: false,
   onBrokenLinks: 'throw',
 
