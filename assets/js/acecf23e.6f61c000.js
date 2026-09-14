@@ -1,1 +1,0 @@
-"use strict";(self.webpackChunkOlympiad_Portal_Documentaion=self.webpackChunkOlympiad_Portal_Documentaion||[]).push([["3220"],{1912(a){a.exports=JSON.parse('{"blogBasePath":"/Olympiad-Documentation/blog","blogTitle":"Blog","authorsListPath":"/Olympiad-Documentation/blog/authors"}')}}]);
