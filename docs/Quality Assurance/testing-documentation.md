@@ -30,7 +30,7 @@ Our automated testing suite is separated into distinct layers to optimize execut
 * **Key Targets:**
   * **Round State Machine (`src/domain/rounds/round-state-machine.ts`):** Verifies deterministic phase transitions (`draft` $\rightarrow$ `open` $\rightarrow$ `closed` $\rightarrow$ `grading` $\rightarrow$ `released`) based on UTC timestamps and administrative overrides.
   * **Automated Notification Engine (`src/domain/notifications/automation-engine.ts`):** Validates email queue filtering, idempotency constraints, and threshold detection for round opening/closing reminders.
-* **Characteristics:** 100% deterministic, executed in $<1$ second.
+* **Characteristics:** 100% deterministic, executed in less than 1 second.
 
 ---
 
