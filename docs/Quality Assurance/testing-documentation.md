@@ -175,11 +175,19 @@ Testers complete structured user journeys followed by an evaluation survey captu
 
 ---
 
-## 4. Test Suite Inventory
+## 4. Performance Report
+
+Application performance is audited with **Google PageSpeed Insights** (Lighthouse) against the production deployment. The linked report measures the desktop form factor across the Core Web Vitals metrics and the Lighthouse performance, accessibility, best-practices, and SEO categories.
+
+* **Latest Desktop Analysis:** [Google PageSpeed Insights — Olympiad Portal (Desktop)](https://pagespeed.web.dev/analysis/https-olympiad-portal-eta-verel-app/t76ytlrxx9?form_factor=desktop)
+
+---
+
+## 5. Test Suite Inventory
 
 | Suite Location | Scope / Target | Focus Area |
 | :--- | :--- | :--- |
-| `tests/domain/round-state-machine.test.ts` | Unit | Time-based phase calculation & state transitions |
+| `tests/domain/round-state-machine.test.ts`  hide appeal button ( advanced feature , shouldnt be imple| Unit | Time-based phase calculation & state transitions |
 | `tests/domain/automation-engine.test.ts` | Unit | Notification queue logic & idempotency |
 | `tests/domain/public-api-queries.test.ts` | Unit | Public read queries: key mapping, portal grouping, numeric coercion & file-URL filtering |
 | `tests/domain/public-api-access.test.ts` | Unit | Visibility gates: closed/released availability for papers and published marks |
