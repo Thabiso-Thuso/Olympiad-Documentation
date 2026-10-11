@@ -2,6 +2,8 @@
 
 This website is built using [Docusaurus](https://docusaurus.io/), a modern static website generator.
 
+> **Note**: This documentation site is a deployable copy of the documentation site hosted on Gitea. It is an exact copy of the git clone from: https://github.com/Jonaphan-Mareno/olympiade-portal
+
 ## Installation
 
 ```bash

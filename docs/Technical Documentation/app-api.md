@@ -18,6 +18,8 @@ The global Next.js middleware (`src/middleware.ts`) **explicitly bypasses** all 
 | `POST /api/student/sitting/save`               | **Required**    | Supabase session cookie                |
 | `GET /api/student/sitting/sync`                | **Required**    | Supabase session cookie                |
 | `POST /api/student/sitting/submit`             | **Required**    | Supabase session cookie                |
+| `GET /api/rounds/[roundId]/paper`              | **Required**    | Supabase session cookie (organiser owner / accepted educators / the round's entrants after publication) |
+| `GET /api/scripts/[pageId]`                    | **Required**    | Supabase session cookie (entrant after publication / school educators / organiser) |
 | `GET /api/certificates/[submissionId]`         | **None**        | Open (depends on URL knowledge)        |
 | `GET` / `POST` `/api/webhooks/round-scheduler` | **Conditional** | `CRON_SECRET` bearer token (see below) |
 
@@ -102,6 +104,11 @@ Starts or resumes an online exam sitting for an authenticated student. Validates
 - **Auth Required**: Yes (Supabase session cookie)
 - **Use case**: Starting a test session.
 
+**Behaviour**
+
+- **On create** — deals a per-entrant, difficulty-balanced random **variant** from the round's question pool, filled to `rounds.targetTotalMarks`, and persists it on the new `examSittings` row as `variantQuestionIds` (the ordered subset) plus an opaque `variantSeed` (a stable seed for the option shuffle). Both are frozen for the sitting's lifetime.
+- **On resume** — an already-`active` sitting is returned **as-is** with `resumed: true`; the frozen variant is reused and **no redraw** occurs, so a reconnecting student sees exactly the same subset and option order. The whole operation runs in one transaction, so concurrent starts collapse onto a single active sitting (and its already-dealt variant).
+
 **Request Body (JSON)**
 
 | Field     | Type     | Required | Description             |
@@ -129,11 +136,17 @@ Persists (or updates) a single answer for an active exam sitting. Uses an upsert
 
 **Request Body (JSON)**
 
-| Field            | Type     | Required | Description                     |
-| :--------------- | :------- | :------- | :------------------------------ |
-| `sittingId`      | `string` | Yes      | UUID of the active exam sitting |
-| `questionNumber` | `number` | Yes      | 1-based question index          |
-| `answerValue`    | `string` | Yes      | The student's answer text       |
+| Field         | Type     | Required | Description                                                                     |
+| :------------ | :------- | :------- | :------------------------------------------------------------------------------ |
+| `sittingId`   | `string` | Yes      | UUID of the active exam sitting                                                 |
+| `questionId`  | `string` | Yes      | UUID of the question being answered. Matching sub-answers use a composite form `${questionId}_${pairIndex}` (see below). |
+| `answerValue` | `string` | Yes      | The student's answer text (or, for a matching pair, the chosen response)        |
+
+**Validation & variant scoping**
+
+- **Out-of-variant questions are rejected.** The sitting's frozen `variantQuestionIds` is authoritative: a question outside the assigned variant returns `400` with `"Question is not part of your assigned test"`. (Legacy sittings with a null variant fall back to a round-scoped check only.)
+- **Matching sub-answers.** A `matching` question's pairs are posted individually under a composite `questionId` of the form `${questionId}_${pairIndex}`. The base uuid is split off before the lookup and the sub-answers are **aggregated and stored as ONE `student_answers` row** under the BASE question uuid, whose `answerValue` is a JSON object of pair selections (`{ "<questionId>_<pairIndex>": "<chosen response>" }`). A composite key sent for a non-`matching` question returns `400`.
+- **Malformed ids are client errors.** An invalid / non-uuid `sittingId` returns `400` `"Invalid sitting id"`, and an invalid / non-uuid question id (after splitting off any pair index) returns `400` `"Invalid question id"` — these are rejected up front rather than surfacing as a Postgres `22P02` uuid-syntax `500`.
 
 **Example**
 
@@ -143,7 +156,7 @@ curl -X POST "https://olympiad-portal-eta.vercel.app/api/student/sitting/save" \
   -H "Cookie: sb-access-token=<your-supabase-jwt>" \
   -d '{
     "sittingId": "550e8400-e29b-41d4-a716-446655440000",
-    "questionNumber": 3,
+    "questionId": "9c1f2e3d-4a5b-6c7d-8e9f-0a1b2c3d4e5f",
     "answerValue": "42"
   }'
 ```
@@ -182,6 +195,12 @@ Retrieves all previously saved answers for a given exam sitting. Used to restore
     "status": "active",
     "...": "..."
   },
+  "durationMinutes": 60,
+  "variantQuestionIds": [
+    "9c1f2e3d-4a5b-6c7d-8e9f-0a1b2c3d4e5f",
+    "3f2a71c6-9b0e-4d6f-8c1a-2e5b7d9f0a13"
+  ],
+  "variantSeed": "d1a6f0a3-7c2e-4b8f-9a11-5e0d3c2b1a99",
   "answers": [
     {
       "sittingId": "550e8400-e29b-41d4-a716-446655440000",
@@ -193,6 +212,10 @@ Retrieves all previously saved answers for a given exam sitting. Used to restore
 }
 ```
 
+:::note
+The response now carries the sitting's frozen `variantQuestionIds` and `variantSeed`, so a resumed attempt re-renders **the same subset** in the same order with a **stable option order**. Both are `null` for legacy sittings, which fall back to the whole pool.
+:::
+
 ---
 
 ### 6. Submit Student Sitting
@@ -202,6 +225,12 @@ Submits an active exam sitting, closing it so no further answers can be saved. I
 - **Endpoint**: `POST /api/student/sitting/submit`
 - **Auth Required**: Yes (Supabase session cookie)
 - **Use case**: When the student manually submits their exam or the timer expires.
+
+**Behaviour**
+
+- Auto-marking runs over **only the dealt variant**, resolved through the shared loader (`loadSittingQuestions`, which scopes to `variantQuestionIds` and falls back to the whole pool for legacy sittings), so answers to out-of-variant questions can never be scored.
+- `matching` questions earn **proportional credit** (`correctPairs / totalPairs × marks`); the total is rounded to two decimals. `free_text` questions are left for educators and stay out of the auto-marked subtotal.
+- The score denominator is the round's **fixed target total** (`rounds.targetTotalMarks`, falling back to the pool total), so different variants stay directly comparable. The `results.feedback` string is `"Auto-marked: <score> / <targetTotalMarks>"`.
 
 **Request Body (JSON)**
 
@@ -255,6 +284,82 @@ Entry point for the automated round-reminder sweep (opening, closing, overdue, a
 
 ---
 
+### 9. Round Question Paper & Memo
+
+Serves a round's printable documents to the schools running it: the question paper and the memo. When the organiser uploaded a PDF it is served (redirected) directly; otherwise the document is generated on the fly from the organiser's ordered physical selection (`questionPapers.selectedQuestionIds`, falling back to the whole pool for legacy papers), so online and hybrid rounds can be sat on paper too.
+
+- **Endpoint**: `GET /api/rounds/[roundId]/paper`
+- **Auth Required**: Yes (Supabase session cookie) — **organiser owner** (`portals.ownerUserId`) or an **accepted educator** of the round's portal.
+- **Use case**: Educators printing a physical paper/memo for their school; organisers previewing a sample online variant.
+
+**Query Parameters**
+
+| Parameter  | Type     | Required | Description                                                                                                                        |
+| :--------- | :------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`     | `string` | No       | `paper` (default) or `memo`.                                                                                                       |
+| `variant`  | `string` | No       | `preview` renders a **sample online variant** instead of the physical document (organiser/educator only). Any other value is ignored. |
+
+**Access gating**
+
+- The **owner** may download at any time.
+- An **educator** is time-gated: the paper is available once the round **opens**, and the memo only once it **closes**, so answers never circulate while entrants are still writing (`403` otherwise).
+- An **entrant** who has a submission for the round may download the paper and memo once the round's results are **published** (when their marked script also appears beside an on-screen memo). Entrants never get `?variant=preview`.
+
+**Variant preview (`?variant=preview`)**
+
+- Renders a reproducible **sample** online variant drawn from the round's pool with a **fixed seed** (`FIXED_SEED`), filled to `rounds.targetTotalMarks` — a stable, repeatable illustration of what an entrant gets, never tied to a real sitting.
+- Shows **only the drawn variant's questions**, in variant order. It deliberately does **not** render the whole pool: the lossless ordering (which would append every undrawn question) is avoided because it would leak exam content — including questions still hidden from students mid-round. This is an intentional exam-content leak guard.
+
+**Example**
+
+```bash
+# Physical question paper
+curl "https://olympiad-portal-eta.vercel.app/api/rounds/550e8400-e29b-41d4-a716-446655440000/paper?kind=paper" \
+  -H "Cookie: sb-access-token=<your-supabase-jwt>" --output round-1-question-paper.pdf
+
+# Reproducible sample online variant (organiser/educator preview)
+curl "https://olympiad-portal-eta.vercel.app/api/rounds/550e8400-e29b-41d4-a716-446655440000/paper?variant=preview" \
+  -H "Cookie: sb-access-token=<your-supabase-jwt>" --output round-1-sample-variant.pdf
+```
+
+**Response (200 OK)**
+Returns the PDF document with `Content-Type: application/pdf` and an `attachment` `Content-Disposition`. When the organiser uploaded a PDF, the request is instead redirected (`307`) to its storage URL.
+
+**Error Responses**
+
+| Status | Cause                                                                                     |
+| :----- | :---------------------------------------------------------------------------------------- |
+| `401`  | No authenticated user.                                                                     |
+| `403`  | Not the owner nor an accepted educator; or (educator) the paper/memo is not yet available. |
+| `404`  | Round not found; no paper/memo has been uploaded or generated; or a preview was requested for a round with no questions. |
+
+---
+
+### 10. Marked Script Page
+
+Serves one page image of an entrant's marked paper script. Scripts are stored in the **private** `marked-scripts` bucket; this route is the only way to view them (no public or signed URLs are handed out).
+
+- **Endpoint**: `GET /api/scripts/[pageId]` (`pageId` = `submission_script_pages.id`)
+- **Auth Required**: Yes (Supabase session cookie)
+- **Use case**: The entrant's results page, and the educator/organiser remark screens.
+
+**Access** (`decideScriptAccess` in `src/domain/scripts/script-rules.ts`, the same rule for original and re-marked pages)
+
+- The **entrant** who owns the submission — only once the round's results are published.
+- Anyone who may resolve a remark for it (`canResolveRemark`): an **accepted educator of the entrant's school** in that olympiad, or the **olympiad organiser** — at any time.
+
+**Response (200 OK)**
+The image bytes with the stored `Content-Type` (`image/jpeg`, `image/png` or `image/webp`), `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`.
+
+**Error Responses**
+
+| Status | Cause |
+| :----- | :---- |
+| `401`  | No authenticated user. |
+| `404`  | Unknown page id, or the user may not view it (deliberately indistinguishable, so ids can't be probed). |
+
+---
+
 ## Part 2: How to Use the API Externally
 
 ### Authentication
@@ -294,15 +399,15 @@ Server Actions act as strict RPC (Remote Procedure Call) endpoints. They provide
 Server Actions are **not externally callable** via HTTP. They are invoked exclusively by React form components and client-side `useActionState` hooks within the application. This section documents them for developers working on the codebase; the externally reachable HTTP surface lives in [Part 1](#part-1-standard-rest-endpoints) above, and the open read-only API is covered in the [Public API Documentation](./public-api.md).
 :::
 
-Nearly all educator- and organiser-facing functionality lives here rather than in REST routes: portal and round authoring, question-paper and certificate uploads, AI question generation, invitations, marking, results publication, automations, and notifications. There are ~35 such actions, catalogued below.
+Nearly all educator- and organiser-facing functionality lives here rather than in REST routes: portal and round authoring, question-paper and certificate uploads, AI question generation, invitations, marking, results publication, automations, and notifications. There are ~40 such actions, catalogued below.
 
 ### Conventions
 
 Every action in this section follows the same broad shape:
 
-1. **Resolve the caller** — `const supabase = await createClient(); const { data: { user } } = await supabase.auth.getUser();`. If there is no `user`, the action either `redirect('/login')`, returns an error object, or `throw`s (see per-action notes).
-2. **Authorize** — role and ownership checks are performed against the `memberships`, `portals`, and `users` tables. Membership roles are `organiser`, `educator`, and `student`; platform administrators are flagged by `users.isPlatformAdmin`.
-3. **Mutate** — Drizzle queries run against Postgres (Supabase). File uploads go to Supabase Storage buckets (`applications`, `round-documents`, `question-images`).
+1. **Resolve the caller** — `const supabase = await createClient(); const { data: { user } } = await supabase.auth.getUser();`. If there is no `user`, the action either redirects to the login screen, returns an error object, or `throw`s (see per-action notes).
+2. **Authorize** — role and ownership checks are performed against the `memberships`, `portals`, and `users` tables. Membership roles are `organiser`, `educator`, and `student` (the enum also reserves `reviewer`); platform administrators are flagged by `users.isPlatformAdmin`.
+3. **Mutate** — Drizzle queries run against Postgres (Supabase). File uploads go to Supabase Storage buckets (`applications`, `round-documents`, `question-images`; marked script pages use the private `marked-scripts` bucket via signed upload URLs — see *Marked Scripts* below).
 4. **Side effects** — many actions send email (`sendInviteEmail`, notification dispatch), create in-app notifications (`notifyEducatorsInPortal`), and call `revalidatePath(...)` to refresh cached routes.
 5. **Return / redirect** — actions either return a plain result object (`{ success }`, `{ error }`, or a typed payload), `throw` an `Error`, or call `redirect(...)` (which throws internally and unwinds the action).
 
@@ -336,29 +441,34 @@ Every action in this section follows the same broad shape:
 | 10 | [`deleteOlympiad`](#deleteolympiad) | Portal owner | `.../[olympiadId]/actions.ts` |
 | 11 | [`addEducators`](#addeducators) | Organiser | `.../[olympiadId]/actions.ts` |
 | 12 | [`sendInvitations`](#sendinvitations) | Organiser | `.../[olympiadId]/invite/actions.ts` |
-| 13 | [`createRound`](#createround) | Organiser | `.../rounds/create/actions.ts` |
-| 14 | [`updateRound`](#updateround) | Organiser | `.../rounds/[roundId]/actions.ts` |
+| 13 | [`createRound`](#createround) | Portal owner | `.../rounds/create/actions.ts` |
+| 14 | [`updateRound`](#updateround) | Portal owner | `.../rounds/[roundId]/actions.ts` |
 | 15 | [`deleteRound`](#deleteround) | Organiser | `.../rounds/[roundId]/actions.ts` |
 | 16 | [`publishRoundResults`](#publishroundresults-organiser) | Portal owner | `.../rounds/[roundId]/actions.ts` |
 | 17 | [`generateTestFromPDF`](#generatetestfrompdf) | Organiser | `.../rounds/[roundId]/ai-actions.ts` |
 | 18 | [`generateTestFromBase64PDF`](#generatetestfrombase64pdf) | Organiser | `.../rounds/create/ai-actions.ts` |
-| 19 | [`createRule`](#createrule) | Organiser | `.../[olympiadId]/automations/actions.ts` |
-| 20 | [`deleteRule`](#deleterule) | Organiser | `.../[olympiadId]/automations/actions.ts` |
-| 21 | [`toggleRuleState`](#togglerulestate) | Organiser | `.../[olympiadId]/automations/actions.ts` |
-| 22 | [`runDryRun`](#rundryrun) | Organiser | `.../[olympiadId]/automations/dry-run.ts` |
-| 23 | [`sendBroadcastNotification`](#sendbroadcastnotification) | Organiser | `.../rounds/[roundId]/broadcast-actions.ts` |
-| 24 | [`updateCertificateTemplates`](#updatecertificatetemplates) | Organiser | `.../rounds/[roundId]/certificate/actions.ts` |
-| 25 | [`uploadCertificateTemplate`](#uploadcertificatetemplate) | Organiser | `.../rounds/[roundId]/certificate/actions.ts` |
-| 26 | [`resolveRemark`](#resolveremark) | Organiser | `.../rounds/[roundId]/remarks/actions.ts` |
-| 27 | [`inviteStudents`](#invitestudents) | Educator | `src/app/educator/actions.ts` |
-| 28 | [`submitMarksForModeration`](#submitmarksformoderation) | Educator | `.../rounds/[roundId]/marking/actions.ts` |
-| 29 | [`publishRoundResults`](#publishroundresults-educator) | Educator | `.../rounds/[roundId]/marking/actions.ts` |
-| 30 | [`submitBulkOfflineMarks`](#submitbulkofflinemarks) | Educator | `.../rounds/[roundId]/offline-marks/actions.ts` |
-| 31 | [`requestRemark`](#requestremark) | Educator | `.../results/[submissionId]/actions.ts` |
-| 32 | [`getUnreadNotifications`](#getunreadnotifications) | Educator | `src/app/educator/notifications/actions.ts` |
-| 33 | [`markAsRead`](#markasread) | Educator | `src/app/educator/notifications/actions.ts` |
-| 34 | [`markAllAsRead`](#markallasread) | Educator | `src/app/educator/notifications/actions.ts` |
-| 35 | [`requestStudentRemark`](#requeststudentremark) | Student | `.../(student)/results/scores/[submissionId]/actions.ts` |
+| 19 | [`saveRule`](#saverule) | Portal owner | `.../[olympiadId]/automations/actions.ts` |
+| 20 | [`addRecommendedRules`](#addrecommendedrules) | Portal owner | `.../[olympiadId]/automations/actions.ts` |
+| 21 | [`deleteRule`](#deleterule) | Portal owner | `.../[olympiadId]/automations/actions.ts` |
+| 22 | [`toggleRuleState`](#togglerulestate) | Portal owner | `.../[olympiadId]/automations/actions.ts` |
+| 23 | [`simulateSavedRule`](#simulatesavedrule) | Portal owner | `.../[olympiadId]/automations/dry-run.ts` |
+| 24 | [`simulateDraftRule`](#simulatedraftrule) | Portal owner | `.../[olympiadId]/automations/dry-run.ts` |
+| 25 | [`sendBroadcastNotification`](#sendbroadcastnotification) | Organiser | `.../rounds/[roundId]/broadcast-actions.ts` |
+| 26 | [`updateCertificateTemplates`](#updatecertificatetemplates) | Organiser | `.../rounds/[roundId]/certificate/actions.ts` |
+| 27 | [`uploadCertificateTemplate`](#uploadcertificatetemplate) | Organiser | `.../rounds/[roundId]/certificate/actions.ts` |
+| 28 | [`submitRemarkResolution`](#submitremarkresolution) | Remark resolver (educator or organiser) | `src/components/remarks/actions.ts` |
+| 29 | [`inviteStudents`](#invitestudents) | Educator | `src/app/educator/actions.ts` |
+| 30 | [`submitMarksForModeration`](#submitmarksformoderation) | Educator | `.../rounds/[roundId]/marking/actions.ts` |
+| 31 | [`publishRoundResults`](#publishroundresults-educator) | Educator | `.../rounds/[roundId]/marking/actions.ts` |
+| 32 | [`submitBulkOfflineMarks`](#submitbulkofflinemarks) | Educator | `.../rounds/[roundId]/offline-marks/actions.ts` |
+| 33 | [`getUnreadNotifications`](#getunreadnotifications) | Educator | `src/app/educator/notifications/actions.ts` |
+| 34 | [`markAsRead`](#markasread) | Educator | `src/app/educator/notifications/actions.ts` |
+| 35 | [`markAllAsRead`](#markallasread) | Educator | `src/app/educator/notifications/actions.ts` |
+| 36 | [`requestStudentRemark`](#requeststudentremark) | Student | `.../(student)/results/scores/[submissionId]/actions.ts` |
+| 37 | [`withdrawStudentRemark`](#withdrawstudentremark) | Student | `.../(student)/results/scores/[submissionId]/actions.ts` |
+| 38 | [`prepareScriptUploadAction`](#preparescriptuploadaction) | Educator / remark resolver | `src/components/scripts/actions.ts` |
+| 39 | [`commitScriptUploadAction`](#commitscriptuploadaction) | Educator / remark resolver | `src/components/scripts/actions.ts` |
+| 40 | [`discardScriptUploadAction`](#discardscriptuploadaction) | Educator / remark resolver | `src/components/scripts/actions.ts` |
 
 ### Authentication & Account
 
@@ -535,7 +645,7 @@ Bulk-invite educators across many schools in one submission.
 sendInvitations(portalId: string, formData: FormData): Promise<void>
 ```
 
-- **Role:** Organiser (authenticated); redirects to `/login` if absent.
+- **Role:** Organiser (authenticated); redirects to the login screen if absent.
 - **Inputs:** `schoolCount` and the same indexed per-school fields as `createPortal`.
 - **Behaviour:** single transaction; `ensureSchool` per entry (re-inviting a school reuses its row) then `inviteEducatorsToSchool`; emails sent after commit.
 - **Returns:** `{ error }` on failure; otherwise `revalidatePath` + `redirect('/organiser/olympiads/<portalId>')`.
@@ -544,16 +654,25 @@ sendInvitations(portalId: string, formData: FormData): Promise<void>
 
 Rounds support three `deliveryMethod` values — `paper`, `online`, and `hybrid` — which determine whether a PDF is uploaded, an online question set is authored, or both. All timestamps are parsed as SAST (`+02:00`).
 
+Both `createRound` and `updateRound` author a **question pool** for every delivery method and share the same grading/variant model:
+
+- **`targetTotalMarks`** — the unified grading base for **all** delivery methods. Online sittings deal a per-entrant variant filled to this total, and it is the single score denominator for marking, results and advancement. Nullable: paper/hybrid may omit it and fall back to the selected paper total.
+- **`selectedQuestionIds`** — the organiser's **ordered physical selection** for paper/hybrid rounds (a hand-picked subset of the pool used to build the printable PDF), stored on `questionPapers`.
+- **Per-question `difficulty`** — an integer `1`–`5` used to difficulty-balance the online/hybrid variant draw. **`marks`** is now **nullable** so a draft pool question may omit it.
+- **Publish-readiness guard** — a pure check (shared with the advisory client-side `PublishReadinessPanel`) that **blocks the write** when a *used* question lacks marks/difficulty, or the target total is unreachable by the balanced draw. For online/hybrid the whole pool must be fully specified and the target exactly reachable; for physical papers the selected questions must carry marks.
+
 #### createRound
 
 ```ts
 createRound(formData: FormData): Promise<void>
 ```
 
-- **Role:** Organiser (authenticated).
-- **Inputs:** `portalId`, `name`, `orderIndex`, `opensAt`, `closesAt`, `deliveryMethod`, optional `qualifyingThreshold`, `thresholdTopN`, and method-specific fields (`questionPaper`/`answerKey` files, or `questionsData` JSON + `image_<id>` files).
-- **Guard:** `closesAt` must be after `opensAt`.
-- **Behaviour:** inserts the round; for `paper`/`hybrid` uploads the question paper PDF to `round-documents` and inserts a `questionPapers` row; for `online`/`hybrid` parses `questionsData`, uploads any question images to `question-images`, and inserts `questions`.
+- **Role:** **Portal owner only** (`portals.ownerUserId === user.id`). The `[olympiadId]` URL segment is not trusted — ownership is resolved from the DB before any upload or write, so a round can only be authored into a portal the caller owns.
+- **Inputs:** `portalId`, `name`, `orderIndex`, `opensAt`, `closesAt`, `deliveryMethod`, optional `qualifyingThreshold`, `thresholdTopN`, `targetTotalMarks` (unified grading base, all delivery methods), `selectedQuestionIds` (ordered physical selection for paper/hybrid), and method-specific fields (`questionPaper`/`answerKey` files, or `questionsData` JSON + `image_<id>` files). Each `questionsData` entry may carry a per-question `difficulty` (`1`–`5`, online/hybrid) and a nullable `marks` (a draft may omit it).
+- **Guards:**
+  - `closesAt` must be after `opensAt`; if `targetTotalMarks` is present it must be a whole number ≥ 1.
+  - **Publish-readiness guard** (runs before any upload/write, so a not-ready round neither leaks a file nor persists half a round): blocks the write when a used question lacks marks/difficulty or the target total is unreachable.
+- **Behaviour:** inserts the round (with `targetTotalMarks`); inserts a `questionPapers` row for every delivery method, storing the uploaded PDF URL and the ordered `selectedQuestionIds` for paper/hybrid; parses `questionsData` (all methods), uploads any question images to `question-images`, and inserts `questions` (each with nullable `marks` and `difficulty`). All in a single atomic transaction.
 - **Returns:** `throw`s on validation/upload failure; otherwise `revalidatePath` + `redirect('/organiser/olympiads/<portalId>')`.
 
 #### updateRound
@@ -562,13 +681,14 @@ createRound(formData: FormData): Promise<void>
 updateRound(formData: FormData): Promise<void>
 ```
 
-- **Role:** Organiser (authenticated).
-- **Inputs:** `portalId`, `roundId`, and the same round fields as `createRound`.
+- **Role:** **Portal owner only** (`portals.ownerUserId === user.id`). Neither the `[olympiadId]` URL segment nor the submitted `roundId`/`portalId` are trusted: the round is joined to its portal and matched on **both** `rounds.id` **and** `rounds.portalId`, and ownership is verified from the DB before any write.
+- **Inputs:** `portalId`, `roundId`, and the same round fields as `createRound` — including `targetTotalMarks`, the ordered `selectedQuestionIds`, and per-question `difficulty` / nullable `marks`.
 - **Guards:**
-  - `closesAt` must be after `opensAt`.
-  - For `online`/`hybrid`, editing is **blocked once any student has a live sitting** on the round's paper.
+  - `closesAt` must be after `opensAt`; if `targetTotalMarks` is present it must be a whole number ≥ 1.
+  - For `online`/`hybrid`, editing is **blocked once any student has a live sitting** on the round's paper. The lock is keyed on the **stored** delivery method (not the submitted form field), so posting `deliveryMethod: 'paper'` for a live online round cannot skip it. Any variants already dealt are frozen and will not change.
   - Question validation: `free_text` questions require marking guidelines; choice questions require a selected answer that exists in `options`; `matching` questions require pairs.
-- **Behaviour:** updates round fields; optionally replaces the question paper / answer-key memo PDFs (a new paper triggers an in-app "Question Paper Available" notification to educators); deletes and re-inserts the question set for online/hybrid.
+  - **Publish-readiness guard** (runs before any write): blocks the write when a used question lacks marks/difficulty or the target total is unreachable. **Legacy exemption** — a round that predates difficulty/target authoring (no `targetTotalMarks` **and** every pool question has a null difficulty) skips the readiness checks, so it stays editable without retrofitting the whole pool.
+- **Behaviour:** updates the round fields (including `targetTotalMarks`); optionally replaces the question paper / answer-key memo PDFs (a new paper triggers an in-app "Question Paper Available" notification to educators); and applies an **id-preserving upsert** to the question set — updating unchanged rows, inserting new ones, and deleting only rows that disappeared from the payload, so a persisted `selectedQuestionIds` / dealt `variantQuestionIds` is never orphaned and `studentAnswers` are never cascade-deleted.
 - **Returns:** `throw`s on guard failure; otherwise `revalidatePath` + `redirect('/organiser/olympiads/<portalId>')`.
 
 #### deleteRound
@@ -636,16 +756,29 @@ generateTestFromBase64PDF(base64Pdf: string, base64Memo?: string | null):
 
 **Automations** — `.../[olympiadId]/automations/actions.ts`, `.../automations/dry-run.ts`
 
-Automation rules drive scheduled reminder emails. A rule's `triggerType` is one of `round_opening`, `round_closing`, `submission_overdue`, or `results_published`, fired relative to the round by `triggerOffsetMinutes`.
+Automation rules drive scheduled reminder emails. A rule's `triggerType` is one of `round_opening`, `round_closing`, `submission_overdue`, or `results_published`, fired relative to the round by `triggerOffsetMinutes`. All four mutating actions below first verify that the caller owns the olympiad (`assertPortalOwner` against `portals.ownerUserId`), and untrusted form input is normalised by `validateDraft` (`.../automations/rule-input.ts`).
 
-#### createRule
+#### saveRule
+
+Creates a rule — or updates an existing one when `ruleId` is given.
 
 ```ts
-createRule(formData: FormData): Promise<void>
+saveRule(portalId: string, rawDraft: unknown, ruleId?: string): Promise<{ error?: string }>
 ```
 
-- **Inputs:** `portalId`, `name`, `triggerType`, `triggerOffsetMinutes`, `templateSubject`, `templateHtml`, and a `missingSubmissionsOnly` toggle stored in `conditions`.
-- **Behaviour:** inserts an `automationRules` row with `isActive = true`; `revalidatePath('.../automations')`.
+- **Inputs:** a `RuleDraft` — `name`, `triggerType`, timing as `offsetAmount` / `offsetUnit` (`minutes`/`hours`/`days`) and `direction` (`before`/`after`), optional `roundIds`, `missingSubmissionsOnly`, `includeEntrants`, `subject` (optional template-subject override, ≤ 200 chars), `note` (plain-text addition to the email body, ≤ 2000 chars) and `isActive`.
+- **Behaviour:** validates the draft, stores the signed minute offset (`triggerOffsetMinutes`) and `conditions`, inserts or updates the portal-scoped row, then revalidates the automations page.
+- **Returns:** `{ error }` on validation failure; otherwise `{}`.
+
+#### addRecommendedRules
+
+One-click install of the recommended rule set (`RECOMMENDED_RULES` from `src/domain/notifications/automation-rules.ts`).
+
+```ts
+addRecommendedRules(portalId: string): Promise<void>
+```
+
+- **Behaviour:** inserts every recommended rule (active, default templates) for the portal, then revalidates.
 
 #### deleteRule
 
@@ -663,20 +796,31 @@ toggleRuleState(ruleId: string, portalId: string, isActive: boolean): Promise<vo
 
 - **Behaviour:** flips `automationRules.isActive` for the portal-scoped rule, then revalidates.
 
-#### runDryRun
+#### simulateSavedRule
 
-Previews who a rule would email and renders a sample message — **without sending anything**.
+"Try against a round": runs a stored rule's real timing check and recipient selection against one round and renders the emails it would send — **without sending anything or writing to `notification_log`**.
 
 ```ts
-runDryRun(ruleId: string, roundId: string): Promise<DryRunResult>
+simulateSavedRule(portalId: string, ruleId: string, roundId: string): Promise<SimulationResult>
 ```
 
-- **Returns `DryRunResult`:**
+#### simulateDraftRule
+
+The same preview for an **unsaved** draft straight from the automation form.
+
+```ts
+simulateDraftRule(portalId: string, rawDraft: unknown, roundId: string): Promise<SimulationResult>
+```
+
+- **Returns `SimulationResult`:** `{ error }`, or
   ```ts
-  { ruleName: string; matchedRecipients: number;
-    sampleEmail?: { to: string; subject: string; html: string }; error?: string }
+  { ruleName: string; roundName: string; triggerLabel: string; schedule: string;
+    timing: { status: string; fireAt: string | null; reason: string };
+    recipients: { email: string; schoolName: string | null;
+                  audience: 'school' | 'entrant'; alreadySent: boolean }[];
+    sample: { to: string; subject: string; html: string } | null }
   ```
-- **Behaviour:** loads the rule and round, resolves educators and entrant submission status, then computes `matchedRecipients` and a representative `sampleEmail` per `triggerType` using the shared email templates. Returns `{ error }` if the rule or round is missing.
+- **Behaviour:** both check that the caller owns the round's portal; recipients are planned via `planRuleEmails` (educator or entrant audiences, per the trigger), `alreadySent` marks recipients a previous run already delivered (read from `notification_log`), and `sample` previews a school-level email when one exists. Returns `{ error }` if the round or rule is missing or the draft is invalid.
 
 **Broadcast** — `.../rounds/[roundId]/broadcast-actions.ts`
 
@@ -719,18 +863,25 @@ uploadCertificateTemplate(roundId: string, formData: FormData): Promise<{ public
 - **Behaviour:** uploads to the `round-documents` bucket and returns the public URL (used to populate `templateUrl` in `updateCertificateTemplates`).
 - **Returns:** `throw`s if no file or the upload fails.
 
-**Remarks** — `.../rounds/[roundId]/remarks/actions.ts`
+**Remarks** — `src/components/remarks/actions.ts`
 
-#### resolveRemark
+#### submitRemarkResolution
 
-Resolves an educator- or student-initiated remark request.
+Applies an entrant's appeal: records the re-marked outcome and, for online rounds, the new per-question marks. Shared by the educator and organiser remark screens.
 
 ```ts
-resolveRemark(resultId: string, outcome: string): Promise<{ success: boolean; error?: string }>
+submitRemarkResolution(input: {
+  requestId: string; note: string;
+  questionMarks?: Record<string, number>; newTotal?: number;
+}): Promise<{ error?: string; newScore?: number }>
 ```
 
-- **Behaviour:** sets `results.status = 'remark_resolved'` and stores `remarkOutcome`, then notifies all educators in the portal (in-app) with a link to the result.
-- **Returns:** `{ success: true }` or `{ success: false, error }`.
+- **Role:** An accepted educator at the entrant's school in that olympiad, or the olympiad's organiser (`canResolveRemark`). The action delegates to `resolveRemarkRequest` (`src/domain/remarks/remarks.ts`), which:
+  - requires a pending request and an outcome explanation (`note`);
+  - **online rounds:** validates every per-question mark against the question maximum and sums them into the new total; **paper rounds:** takes the re-marked `newTotal` directly;
+  - writes the new total to `results.score` (with `status = 'remark_resolved'` and `remarkOutcome`) — the single source read by standings, rankings, certificates and next-round qualification — and re-runs `advanceQualifyingEntrants` for published rounds so a corrected mark can still qualify (advancement is never removed);
+  - the outcome is surfaced to the entrant on their notifications page.
+- **Returns:** `{ newScore }` on success; `{ error }` when the caller may not remark the paper, the request is no longer pending, or a mark fails validation.
 
 ### Educator
 
@@ -743,7 +894,12 @@ Educators are school-scoped: their membership ties a `userId` to a specific `por
 Invites students to the educator's own school within a portal.
 
 ```ts
-inviteStudents(formData: FormData): Promise<{ success?: true; count?: number; error?: string }>
+inviteStudents(formData: FormData): Promise<{
+  success?: true;
+  count?: number;
+  skipped?: { email: string; reason: string }[];
+  error?: string;
+}>
 ```
 
 - **Role:** Educator with an **accepted** membership for the given `portalId` + `schoolId`.
@@ -752,14 +908,15 @@ inviteStudents(formData: FormData): Promise<{ success?: true; count?: number; er
   - The caller must hold an accepted `educator` membership for that exact portal **and** school.
   - Defense-in-depth: the target `school` row must belong to `portalId` (legacy rows predating the membership guard are rejected).
 - **Behaviour (per unique email):**
-  - Already an accepted member → skipped.
+  - Already registered for this olympiad through **another school** (accepted or pending) → skipped and reported; the membership is never moved between schools.
+  - Already an accepted member of this school → skipped and reported.
   - Existing user, no membership → membership inserted as **accepted**.
   - No account → membership inserted as **invited** and an invite email is queued.
   - Pending invite whose owner now has an account → linked and accepted.
-  - Pending invite, still no account → re-sent with the original token, re-pointed at this school.
+  - Pending invite at this school, still no account → re-sent with the original token (reported as re-sent).
   - Invite emails are sent after the DB loop; the whole operation is wrapped in try/catch.
 - **Side effects:** `revalidatePath('/educator')`, `/educator/entrants`, and `/organiser/olympiads/<portalId>`.
-- **Returns:** `{ error }` on guard/DB failure; otherwise `{ success: true, count }`.
+- **Returns:** `{ error }` on guard/DB failure; otherwise `{ success: true, count, skipped }`, where `count` is the number of students actually added and `skipped` lists every email that wasn't, with the reason (shown to the educator under the form).
 
 **Marking** — `src/app/educator/rounds/[roundId]/marking/actions.ts`
 
@@ -818,19 +975,40 @@ submitBulkOfflineMarks(
 - **Side effects:** `revalidatePath('/educator/rounds/<roundId>/offline-marks')`.
 - **Returns:** `{ error }` if unauthenticated/not an educator/on DB failure; otherwise `{ success: true }`.
 
-**Results & Remarks** — `src/app/educator/results/[submissionId]/actions.ts`
+**Marked Scripts** — `src/components/scripts/actions.ts`
 
-#### requestRemark
+Shared by the offline-marks page (original pages) and the remark screens (re-marked pages). The target is `{ kind: 'original', roundId, studentMembershipId }` or `{ kind: 'remarked', remarkRequestId }`. Page bytes never pass through a Server Action: the browser uploads each page straight to a one-off signed upload URL, and the server then checks what actually arrived. All rules live in `src/domain/scripts/`.
 
-Flags a result for the organiser to review.
+- **Original pages:** the same checks as `submitBulkOfflineMarks` (accepted educator at the entrant's school, round not `online`, marking window open); creates the offline submission if the entrant has none.
+- **Re-marked pages:** the remark must be a **pending** paper remark the caller may resolve (`canResolveRemark`). Original pages are never touched.
+
+#### prepareScriptUploadAction
 
 ```ts
-requestRemark(submissionId: string, reason: string): Promise<{ success: boolean; error?: string }>
+prepareScriptUploadAction(target, files: { contentType: string; size: number }[])
+  : Promise<{ uploads?: { path: string; token: string }[]; error?: string }>
 ```
 
-- **Role:** Authenticated educator.
-- **Behaviour:** sets `results.status = 'remark_requested'` and stores `remarkReason` for the submission.
-- **Returns:** `{ success: true }` or `{ success: false, error }`; revalidates `/educator/results/<submissionId>`.
+Validates the page count (1–30), each claimed type (JPEG/PNG/WebP) and size (≤ 10 MB), authorises, and issues one signed upload URL per page at `{roundId}/{submissionId}/{kind}/{uuid}.{ext}`.
+
+#### commitScriptUploadAction
+
+```ts
+commitScriptUploadAction(target, pages: { path: string; contentType: string }[])
+  : Promise<{ success?: true; pageCount?: number; error?: string }>
+```
+
+Re-authorises (so a window that closed meanwhile is respected), accepts only paths issued for that submission and kind, downloads each page and checks its magic bytes and size, then replaces that script's rows in one transaction and deletes the replaced storage objects. On any failure the new objects are deleted.
+
+#### discardScriptUploadAction
+
+```ts
+discardScriptUploadAction(target, paths: string[]): Promise<void>
+```
+
+Best-effort cleanup when a page fails to upload: deletes the target's issued paths that are not part of a saved script.
+
+**Remarks** — educators resolve appeals from their remark queue (`/educator/remarks/<requestId>`) through the shared [`submitRemarkResolution`](#submitremarkresolution) action (`src/components/remarks/actions.ts`), documented with the organiser actions above.
 
 **In-App Notifications** — `src/app/educator/notifications/actions.ts`
 
@@ -869,15 +1047,31 @@ markAllAsRead(): Promise<void>
 Lets a student dispute their own result.
 
 ```ts
-requestStudentRemark(submissionId: string, reason: string): Promise<{ success: boolean; error?: string }>
+requestStudentRemark(
+  submissionId: string,
+  reason: string,
+  paperQuery?: { questionRefs: string; pins: { page: number; x: number; y: number; note: string }[] }
+): Promise<{ success: boolean; error?: string }>
 ```
 
 - **Role:** Student, with an **ownership check** — the submission's membership must belong to the caller (`memberships.userId === user.id`).
 - **Behaviour:** sets `results.status = 'remark_requested'` and stores `remarkReason`, then revalidates `/results/scores/<submissionId>`.
+- **Paper scripts only:** `paperQuery` stores `remark_requests.question_refs` (≤ 200 chars) and `pins` (≤ 10; `page` must be an original page of the uploaded script, `x`/`y` in [0, 1], `note` ≤ 300 chars). It is rejected for online submissions.
 - **Returns:** `{ success: true }`, or `{ success: false, error }` when unauthorized or on failure.
 
+- **Attempts:** up to 2 requests per submission (`REMARK_MAX_ATTEMPTS`), one pending at a time; withdrawn requests count.
+
+#### withdrawStudentRemark
+
+```ts
+withdrawStudentRemark(submissionId: string, requestId: string): Promise<{ success: boolean; error?: string }>
+```
+
+- **Role:** Student who owns the submission.
+- **Behaviour:** sets a **pending** request to `withdrawn` (it still counts as an attempt) and resets the result summary (`results.status` back to `remark_resolved` if an earlier remark was completed, else `auto_marked`). Fails if a marker has already resolved it; the conditional update means only one of withdraw/resolve can win.
+
 :::note
-This mirrors the educator's [`requestRemark`](#requestremark) but adds a strict ownership guard, since students may only act on their own submissions.
+Student appeals are created by the two actions above and resolved by [`submitRemarkResolution`](#submitremarkresolution). Eligibility — results published, a 14-day window (`REMARK_WINDOW_DAYS`), a 2-attempt limit (`REMARK_MAX_ATTEMPTS`), one pending request at a time — is enforced by `getRemarkEligibility` in `src/domain/remarks/remarks.ts`.
 :::
 
 ### Authorization Summary
@@ -889,15 +1083,19 @@ This mirrors the educator's [`requestRemark`](#requestremark) but adds a strict 
 | Admin actions | `users.isPlatformAdmin` | `verifyPlatformAdmin()` |
 | `submitOrganiserApplication` | Authenticated | `getUser()` |
 | `createPortal` | Approved organiser application | `organiserApplications.status` |
-| `deleteOlympiad`, organiser `publishRoundResults` | Portal owner | `portals.ownerUserId` |
-| Round/automation/certificate/broadcast/remark actions | Authenticated organiser | `getUser()` + portal scoping |
+| `deleteOlympiad`, `createRound`, `updateRound`, organiser `publishRoundResults` | Portal owner | `portals.ownerUserId` |
+| Round/certificate/broadcast/remark actions | Authenticated organiser | `getUser()` + portal scoping |
+| Automation rules (`saveRule`, `addRecommendedRules`, `deleteRule`, `toggleRuleState`) | Portal owner | `assertPortalOwner()` (`portals.ownerUserId`) |
+| Automation dry runs (`simulateSavedRule`, `simulateDraftRule`) | Portal owner | `loadOwnedRound` (round's portal owner) |
 | `inviteStudents`, `submitMarksForModeration` | Educator for the school | `memberships` (role + `schoolId` + `portalId`) |
 | `submitBulkOfflineMarks` | Any educator membership | `memberships.role` |
 | `requestStudentRemark` | Owns the submission | `memberships.userId` |
+| Script uploads (original) | Accepted educator at the entrant's school, marking window open | `loadOfflineMarkingRound` + `checkEntrantsAtEducatorSchools` |
+| Script uploads (re-marked) | May resolve the pending remark | `canResolveRemark` |
 
 :::caution Known gaps
 A few actions authenticate the caller but do **not** re-verify portal ownership before mutating:
-- `updateRound`, `deleteRound`, `createRule`, `deleteRule`, `toggleRuleState`, `updateCertificateTemplates`, and the AI generation actions check only that a user is signed in (portal scoping happens via the ids passed in).
+- `deleteRound`, `updateCertificateTemplates`, and the AI generation actions check only that a user is signed in (portal scoping happens via the ids passed in). `createRound`, `updateRound`, and the automation actions (`saveRule`, `addRecommendedRules`, `deleteRule`, `toggleRuleState`, `simulateSavedRule`, `simulateDraftRule`) are **no longer** in this group — they re-verify `portals.ownerUserId` before writing.
 - The educator `publishRoundResults(roundId)` sets `resultsPublishedAt` without an ownership or round-state check.
 
 Treat these as trusted-UI actions: they are safe as wired into the organiser/educator pages, but any new call site should add an explicit authorization guard.
@@ -909,7 +1107,7 @@ Treat these as trusted-UI actions: they are safe as wired into the organiser/edu
 
 Our application standardizes error handling across both REST routes and Server Actions. When a failure occurs, the client intercepts the following codes and renders the appropriate toast notification or redirect:
 
-- **401 Unauthorized**: The Supabase session is missing or expired. The client automatically redirects to `/login`.
+- **401 Unauthorized**: The Supabase session is missing or expired. The client automatically redirects to the login page.
 - **403 Forbidden**: The user is authenticated but lacks the specific `membership` role required for the action (e.g., a Student attempting to call `createRound`).
 - **404 Not Found**: The requested resource (e.g., an Olympiad ID) does not exist or belongs to another portal.
 - **500 Internal Server Error**: An unhandled database exception occurred. The error is logged to the console, and a generic "Something went wrong" toast is presented to the user to prevent leaking schema details.

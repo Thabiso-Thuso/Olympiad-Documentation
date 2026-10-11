@@ -11,10 +11,14 @@ Competitions are structured into **Rounds**, which represent distinct phases (e.
 - **Delivery Methods**: Rounds can be configured for `online` or `offline` delivery.
 - **Scheduling**: Rounds have strict `opensAt` and `closesAt` timestamps, which dictate when students can participate.
 - **Qualifying Thresholds**: Organizers can set thresholds to automatically determine which students advance to the next round.
+- **Fixed Grading Base (`targetTotalMarks`)**: A round declares a single unified total-marks target that acts as the authoritative grading base for percentages, mark validation, and advancement — and, for online rounds, as the exact draw target the variant generator must hit. The legacy `paperTotalMarks` is kept only as a read fallback.
+- **Publish-Readiness Guard**: A round cannot be published until its question material is fully specified. The guard is pure and DB-free, so the *same* rules run authoritatively in the round-authoring Server Actions and advisorily in the organiser's `PublishReadinessPanel`. For online rounds the entire pool must carry marks and difficulty and the target total must be **reachable** by a balanced draw (proved with a seed-independent exact subset-sum oracle, not a single lucky seed); for physical rounds only the hand-picked selection must carry marks.
 
 ## 3. Online Examination Engine
 The platform includes a robust online testing environment:
-- **Question Banks**: Organizers can create varied question types (multiple choice, free text, matching, etc.) and assign marks.
+- **Question Banks**: Organizers can create varied question types (multiple choice, free text, matching, etc.) and assign marks. Each question may also carry an **organiser-assigned difficulty rating from 1 to 5** used to build balanced variants (this is author-set, *not* derived from entrant responses).
+- **Per-Entrant Difficulty-Balanced Variants**: Rather than serving one identical paper, the online engine draws a **per-entrant variant** from the round's question bank that sums exactly to the round's `targetTotalMarks` while staying balanced across difficulty bands. The dealt variant (`variantQuestionIds`) and a stable option-shuffle `variantSeed` are frozen on the `exam_sitting`, so the paper a student sees is authoritative and reproducible across resumes; a denormalized copy is written to the `submission` at submit time.
+- **Physical Hand-Picked Selection**: For offline/physical rounds, organizers hand-pick an ordered set of questions (`selectedQuestionIds`) into a fixed paper instead of relying on an automated draw.
 - **Exam Sittings**: When a student starts an online exam, a secure `exam_sitting` session is created.
 - **Auto-Saving**: As students progress, their answers are continuously synced to the server to prevent data loss.
 - **Auto-Marking**: Upon submission or when the round closes, the system automatically grades the student's answers against the configured answer key.
@@ -23,11 +27,13 @@ The platform includes a robust online testing environment:
 For offline rounds, the platform supports manual processing:
 - **Document Uploads**: Educators or students can upload scanned answer sheets.
 - **Manual Grading**: Organizers can manually input scores and provide feedback for these submissions.
+- **Marked Scripts**: On the offline-marks page, the school educator enters one total per entrant and can upload photos of the entrant's marked script (JPEG/PNG/WebP, up to 30 ordered pages of 10 MB; phone photos are shrunk to 2400px in the browser; HEIC/PDF are not supported). Scripts can be uploaded or replaced only while the marking window is open, and are frozen once results are published. Pages live in the **private** `marked-scripts` Storage bucket and are only ever served through the authenticated `GET /api/scripts/[pageId]` route. Before publishing, the organiser's round page warns how many scored entrants have no script (publishing is never blocked).
 
 ## 5. Results & Leaderboards
 - **Result Publishing**: Organizers have full control over when results are released to the public.
 - **Public Leaderboards**: Once published, anonymous leaderboards are exposed via the Public API, allowing external sites to display top performers without compromising student privacy.
-- **Remarks/Appeals**: The system supports tracking requests for remarks and logging the outcome.
+- **Remarks/Appeals**: An entrant may appeal up to twice per paper within 14 days of results being published, one request open at a time. A pending request can be withdrawn (e.g. to fix a mistake) and still counts as one of the two; the results page tells the entrant how many they have left. If two markers resolve the same request at once, only the first is saved. The entrant's school educators (or the organiser) re-mark it and must explain the outcome; the new total is written to `results.score`, so standings, certificates and qualification follow it.
+  - **Paper scripts**: after publication the entrant sees their marked script on their results page (paged, full width), with the round's **memo in a sidebar on the right** (below the script on phones) so they can check each answer before deciding whether to appeal. The sidebar lists every question with the correct option(s) highlighted using the paper's letters, matching answers, and written-answer guidelines, plus links to the memo and question paper PDFs; an uploaded memo PDF is embedded when the round has no questions in the system. It appears even when no script was uploaded. When appealing they give the question(s) concerned and the reason, and may drop up to 10 numbered pins with short notes on their pages. The marker sees the script with the same pins, enters the new total and may upload re-marked pages, which the entrant sees as "After remark" beside the untouched originals. An appeal never requires a script to have been uploaded.
 
 ## 6. Automated Certificate Generation
 - **Custom Templates**: Organizers can upload PDF templates for certificates and configure where the student's name should be drawn (X/Y coordinates, font size, and color).
@@ -36,8 +42,9 @@ For offline rounds, the platform supports manual processing:
 
 ## 7. Role-Based Access Control & Memberships
 Authentication is handled by Supabase Auth, but authorization is managed by a granular `memberships` table.
-- **Roles**: Users can hold different roles (e.g., `admin`, `educator`, `student`) within different contexts (Portals and Schools).
-- **Invitations**: Organizers can invite schools to participate, generating secure invite tokens that educators can claim to join a Portal.
+- **Roles**: Users can hold different roles (e.g., `organiser`, `educator`, `student`) within different contexts (Portals and Schools). Platform administrators are flagged separately on the user record (`users.isPlatformAdmin`) rather than through a membership role.
+- **Invitations**: Organizers can invite schools to participate, generating secure invite tokens that educators can claim to join a Portal. Educator addresses in both the Create Portal form and the invite-schools form can be typed one at a time or bulk-added by uploading a CSV — the file is parsed entirely in the browser and never stored, only the extracted addresses join the invite list. When an educator invites students, anyone already registered (at their school or another school in that olympiad) is listed back to them as not added, rather than silently skipped or moved.
+- **One entry per school for educators**: school rows are stored per olympiad, so a school taking part in several olympiads has one row in each. The educator's school picker lists it once (matched by name, ignoring case and spacing), and the educator pages (dashboard, entrants, rounds, offline marks, results, remarks, standings) combine all of that school's olympiads (`src/domain/educator/active-school.ts`).
 
 ## 8. Notifications & Automations
 - **Round Scheduler**: A cron job (Vercel Cron) routinely checks round states and triggers state changes (e.g., opening a round, closing it, or publishing results).
@@ -46,4 +53,4 @@ Authentication is handled by Supabase Auth, but authorization is managed by a gr
 - **Automation Rules**: Organizers can configure custom event-driven rules to trigger specific actions (like sending custom emails) based on portal activity.
 
 ## 9. Public API
-A fully open, CORS-enabled Public API allows external platforms to integrate with the Olympiad Portal. It exposes directories of participating schools, available portals, upcoming rounds, and anonymized results.
+A fully open, CORS-enabled Public API allows external platforms to integrate with the Olympiad Portal. It exposes directories of participating schools, available portals, upcoming rounds, and anonymized results. Once a round has closed, the question bank is readable through the API, and each exposed question now includes its organiser-assigned **`difficulty`** rating (1–5, or `null` for physical/legacy questions).
